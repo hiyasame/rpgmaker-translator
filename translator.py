@@ -81,13 +81,18 @@ class JSONJapaneseLocalizer:
         japanese_pattern = re.compile(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]')
         return bool(japanese_pattern.search(text))
     
+    def should_skip_translation(self, path: str) -> bool:
+        """检查是否应该跳过翻译（如果路径包含bgm或bgs）"""
+        path_lower = path.lower()
+        return 'bgm' in path_lower or 'bgs' in path_lower
+    
     def collect_japanese_texts(self, data: Any, texts: List[Tuple[str, str]] = None, path: str = "") -> List[Tuple[str, str]]:
         """收集所有日文字符串及其位置路径"""
         if texts is None:
             texts = []
         
         if isinstance(data, str):
-            if self.is_japanese(data):
+            if self.is_japanese(data) and not self.should_skip_translation(path):
                 texts.append((path, data))
         elif isinstance(data, dict):
             for key, value in data.items():
@@ -100,46 +105,69 @@ class JSONJapaneseLocalizer:
         
         return texts
     
-    def translate_batch_with_gemini(self, texts: List[str], batch_id: int = 0) -> List[str]:
+    def translate_batch_with_gemini(self, texts: List[str], batch_id: int = 0, max_retries: int = 3) -> List[str]:
         """使用Gemini批量翻译文本（支持并发调用）"""
         if not texts:
             return []
         
-        # 等待速率限制
-        self.rate_limiter.wait_if_needed()
-        
-        # 构建编号文本
-        numbered_text = "\n".join([f"{i+1}. {text}" for i, text in enumerate(texts)])
-        
-        prompt = f"""请将以下日文文本翻译成中文。
+        for retry in range(max_retries + 1):
+            # 等待速率限制
+            self.rate_limiter.wait_if_needed()
+            
+            # 构建编号文本
+            numbered_text = "\n".join([f"{i+1}. {text}" for i, text in enumerate(texts)])
+            
+            prompt = f"""请将以下日文文本翻译成中文。
 
 要求：
 1. 保持编号格式（1. 2. 3. ...）
 2. 逐行翻译，每行对应一个编号
 3. 翻译要准确自然
 4. 只返回翻译结果，不要添加其他说明
+5. 必须返回{len(texts)}行翻译结果
 
 待翻译文本：
 {numbered_text}
 
 中文翻译："""
 
-        try:
-            start_time = time.time()
-            response = self.genai_model.generate_content(prompt)
-            duration = time.time() - start_time
-            
-            if response.text:
-                result = self.parse_gemini_response(response.text.strip(), texts, batch_id)
-                print(f"✅ 批次{batch_id} 完成 ({duration:.2f}s)")
-                return result
-            else:
-                print(f"⚠️ 批次{batch_id} Gemini返回空响应，保留原文")
-                return texts
+            try:
+                start_time = time.time()
+                response = self.genai_model.generate_content(prompt)
+                duration = time.time() - start_time
                 
-        except Exception as e:
-            print(f"❌ 批次{batch_id} Gemini翻译失败: {e}")
-            return texts  # 翻译失败返回原文
+                if response.text:
+                    result = self.parse_gemini_response(response.text.strip(), texts, batch_id)
+                    
+                    # 检查返回的翻译数量是否匹配
+                    if len(result) == len(texts):
+                        print(f"✅ 批次{batch_id} 完成 ({duration:.2f}s)")
+                        return result
+                    else:
+                        if retry < max_retries:
+                            print(f"⚠️ 批次{batch_id} 第{retry+1}次尝试：返回{len(result)}条，期望{len(texts)}条，重试中...")
+                            continue
+                        else:
+                            print(f"❌ 批次{batch_id} 重试{max_retries}次后仍不匹配，保留原文")
+                            return texts
+                else:
+                    if retry < max_retries:
+                        print(f"⚠️ 批次{batch_id} 第{retry+1}次尝试：Gemini返回空响应，重试中...")
+                        continue
+                    else:
+                        print(f"❌ 批次{batch_id} 重试{max_retries}次后仍返回空响应，保留原文")
+                        return texts
+                        
+            except Exception as e:
+                if retry < max_retries:
+                    print(f"⚠️ 批次{batch_id} 第{retry+1}次尝试失败: {e}，重试中...")
+                    time.sleep(2)  # 错误后等待2秒再重试
+                    continue
+                else:
+                    print(f"❌ 批次{batch_id} 重试{max_retries}次后仍失败: {e}，保留原文")
+                    return texts
+        
+        return texts  # 不应该到达这里，但保险起见
     
     def parse_gemini_response(self, response_text: str, original_texts: List[str], batch_id: int = 0) -> List[str]:
         """解析Gemini的翻译响应"""
@@ -219,6 +247,25 @@ class JSONJapaneseLocalizer:
         else:
             return data
     
+    def _collect_all_japanese(self, data: Any, texts: List[Tuple[str, str]] = None, path: str = "") -> List[Tuple[str, str]]:
+        """收集所有日文字符串（包括bgm/bgs，用于统计）"""
+        if texts is None:
+            texts = []
+        
+        if isinstance(data, str):
+            if self.is_japanese(data):
+                texts.append((path, data))
+        elif isinstance(data, dict):
+            for key, value in data.items():
+                new_path = f"{path}.{key}" if path else key
+                self._collect_all_japanese(value, texts, new_path)
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                new_path = f"{path}[{i}]"
+                self._collect_all_japanese(item, texts, new_path)
+        
+        return texts
+
     def create_backup(self, file_path: str) -> str:
         """创建文件备份，返回备份文件路径"""
         backup_path = file_path + '.bak'
@@ -242,10 +289,17 @@ class JSONJapaneseLocalizer:
             japanese_texts = self.collect_japanese_texts(data)
             
             if not japanese_texts:
-                print("ℹ️ 未找到日文字符串，跳过该文件")
+                print("ℹ️ 未找到需要翻译的日文字符串，跳过该文件")
                 return
             
             print(f"📝 找到 {len(japanese_texts)} 个日文字符串")
+            
+            # 显示跳过的bgm/bgs相关项目统计
+            all_japanese = []
+            self._collect_all_japanese(data, all_japanese)
+            skipped_count = len(all_japanese) - len(japanese_texts)
+            if skipped_count > 0:
+                print(f"⏭️ 跳过 {skipped_count} 个bgm/bgs相关项目")
             
             # 提取文本内容用于翻译
             texts_to_translate = [text for _, text in japanese_texts]
@@ -406,8 +460,8 @@ def main():
                        help='要处理的目录 (默认: 当前目录)')
     parser.add_argument('--output-suffix', '-s', default=None,
                        help='输出文件后缀 (如指定则生成新文件，否则覆盖原文件)')
-    parser.add_argument('--max-workers', '-w', type=int, default=10,
-                       help='最大并发数 (默认: 8)')
+    parser.add_argument('--max-workers', '-w', type=int, default=6,
+                       help='最大并发数 (默认: 6)')
     parser.add_argument('--rpm', type=int, default=100,
                        help='每分钟请求数限制 (默认: 100, 适用于gemini-2.0-flash)')
     parser.add_argument('--batch-size', '-b', type=int, default=20,
